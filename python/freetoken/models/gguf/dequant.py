@@ -1,5 +1,8 @@
 """GGML block-quant metadata and reference dequantization for native GGUF weights.
 
+The pure-torch dequantizers cover Q4_0, Q8_0 and Q6_K (plus trivial F32/F16/BF16);
+every other type in the tables below reaches its reference path through gguf-py.
+
 This is the *reference / CPU* path, NOT the engine's hot path: GGUF weights stay
 packed and are dequantized inside the borrowed ggml CUDA kernels (see
 ``freetoken.kernel.gguf``). These routines are used only to (a) materialize the few
@@ -10,7 +13,7 @@ dense F32/F16 tensors at load (norms, scales, router) via :func:`dequantize`, an
 Each dequantizer takes the raw little-endian bytes as a ``uint8`` tensor whose
 final axis spans whole blocks, and returns the values in *storage order* (ggml's
 fastest axis first); the caller reshapes to the torch shape (``dims[::-1]``). The
-hot Q4_0/Q6_K references mirror ``ggml-quants.c`` directly; other block types
+hot Q4_0/Q8_0/Q6_K references mirror ``ggml-quants.c`` directly; other block types
 delegate their reference path to gguf-py.
 """
 
@@ -129,6 +132,18 @@ def dequant_q4_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     return ((q - 8.0) * d).reshape(-1).to(out_dtype)
 
 
+def dequant_q8_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q8_0: per 32-elem block = fp16 scale ``d`` + 32 int8 quants; ``w = d*q``.
+
+    Unlike Q4_0 there is no offset — ggml's quantize_row_q8_0 stores
+    ``q = round(w / d)`` with ``d = max|w| / 127`` per block.
+    """
+    raw = raw.reshape(-1, 34)
+    d = _f16_scales(raw, 0, 2)  # [N,1]
+    q = raw[:, 2:34].contiguous().view(torch.int8).to(torch.float32)  # [N,32]
+    return (q * d).reshape(-1).to(out_dtype)
+
+
 def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     """Q6_K: 256-elem super-block = 128B low nibbles + 64B high 2-bits + 16 int8
     sub-scales + fp16 ``d``. Direct vectorization of ggml's two-half loop."""
@@ -178,13 +193,15 @@ def _dequant_gguf_py(raw: torch.Tensor, out_dtype: torch.dtype, ggml_type: int) 
 
 _DEQUANT = {
     GGML_Q4_0: dequant_q4_0,
+    GGML_Q8_0: dequant_q8_0,
     GGML_Q6_K: dequant_q6_k,
 }
+# Q8_0 is deliberately absent: dequant_q8_0 above is the direct implementation, and a
+# loop entry here would silently replace it with the gguf-py delegation.
 for _ggml_type in (
     GGML_Q4_1,
     GGML_Q5_0,
     GGML_Q5_1,
-    GGML_Q8_0,
     GGML_Q2_K,
     GGML_Q3_K,
     GGML_Q4_K,
@@ -245,6 +262,7 @@ __all__ = [
     "BLOCK_SHAPE",
     "row_bytes",
     "dequant_q4_0",
+    "dequant_q8_0",
     "dequant_q6_k",
     "dequantize",
 ]
